@@ -2,6 +2,7 @@
 # 실행: streamlit run app.py
 
 import os
+import tempfile
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -18,15 +19,20 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 # ──────────────────────────────────────────────
-# RAG 체인 구성 (무거운 작업은 캐싱해서 1회만 실행)
+# RAG 체인 구성 (업로드된 PDF 바이트 기준으로 캐싱 → 같은 파일은 1회만 처리)
 # ──────────────────────────────────────────────
 @st.cache_resource(show_spinner="📄 PDF를 읽고 벡터DB를 만드는 중...")
-def build_rag_chain(pdf_path: str):
-    # 1. PDF 로드 & 페이지 분할
-    loader = PyPDFLoader(pdf_path)
+def build_rag_chain(pdf_bytes: bytes, file_name: str):
+    # 1. 업로드된 바이트를 임시 파일로 저장 (PyPDFLoader는 파일 경로가 필요)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    # 2. PDF 로드 & 페이지 분할
+    loader = PyPDFLoader(tmp_path)
     pages = loader.load_and_split()
 
-    # 2. 텍스트 청크 분할
+    # 3. 텍스트 청크 분할
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=300,            # 하나의 청크가 가질 최대 글자 수
         chunk_overlap=20,          # 청크 간 문맥 연결을 위해 겹칠 글자 수
@@ -35,18 +41,18 @@ def build_rag_chain(pdf_path: str):
     )
     texts = text_splitter.split_documents(pages)
 
-    # 3. 임베딩 & 벡터DB 구축
+    # 4. 임베딩 & 벡터DB 구축
     embeddings_model = OpenAIEmbeddings(model="text-embedding-3-small")
     db = Chroma.from_documents(texts, embeddings_model)
 
-    # 4. LLM & 멀티 쿼리 리트리버
+    # 5. LLM & 멀티 쿼리 리트리버
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     retriever_from_llm = MultiQueryRetriever.from_llm(
         retriever=db.as_retriever(),
         llm=llm,
     )
 
-    # 5. 프롬프트 & 체인
+    # 6. 프롬프트 & 체인
     system_prompt = (
         "너는 질문-답변을 돕는 유능한 비서야. "
         "아래 제공된 맥락(context)만을 사용하여 질문에 답해줘. "
@@ -70,36 +76,68 @@ st.set_page_config(page_title="PDF 질문-답변 RAG", page_icon="📚")
 st.title("📚 PDF 기반 질문-답변")
 st.caption("PDF 문서 내용을 기반으로 질문에 답합니다.")
 
-# 사이드바: PDF 경로 설정 (기본값 unsu.pdf)
+# 사이드바: PDF 업로드 & 옵션
 with st.sidebar:
     st.header("설정")
-    pdf_path = st.text_input("PDF 파일 경로", value="unsu.pdf")
+    uploaded_file = st.file_uploader("PDF 파일 업로드", type=["pdf"])
     show_context = st.checkbox("참조 문서 함께 보기", value=False)
+    if st.button("🗑️ 대화 기록 지우기"):
+        st.session_state.messages = []
+        st.rerun()
 
-# PDF 존재 여부 확인 후 체인 준비
-if not os.path.exists(pdf_path):
-    st.warning(f"'{pdf_path}' 파일을 찾을 수 없습니다. 사이드바에서 경로를 확인해 주세요.")
+# PDF가 업로드되지 않았으면 안내 후 중단
+if uploaded_file is None:
+    st.info("👈 왼쪽 사이드바에서 PDF 파일을 업로드하면 질문할 수 있습니다.")
     st.stop()
 
-rag_chain = build_rag_chain(pdf_path)
+# 업로드된 파일로 체인 준비 (같은 파일이면 캐시 재사용)
+pdf_bytes = uploaded_file.getvalue()
+rag_chain = build_rag_chain(pdf_bytes, uploaded_file.name)
 
-# 질문 입력
-question = st.text_input(
-    "질문을 입력하세요",
-    placeholder="예) 아내가 사다 달라고 했던 음식과, 문맥상 추정할 수 있는 아내가 좋아하는 음식은?",
-)
+# 대화 기록 초기화
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if st.button("질문하기", type="primary") and question.strip():
-    with st.spinner("답변을 생성하는 중..."):
-        response = rag_chain.invoke({"input": question})
+# 이전 대화 기록을 화면에 다시 그리기 (누적 표시)
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+        if msg["role"] == "assistant" and show_context and msg.get("context"):
+            with st.expander(f"📑 참조 문서 ({len(msg['context'])}개)"):
+                for i, ctx in enumerate(msg["context"], start=1):
+                    st.markdown(f"**문서 {i} (p.{ctx['page']})**")
+                    st.write(ctx["content"])
 
-    st.subheader("💡 답변")
-    st.write(response["answer"])
+# 질문 입력 (화면 하단 고정)
+question = st.chat_input("질문을 입력하세요")
 
-    if show_context:
+if question:
+    # 사용자 질문을 기록에 추가하고 즉시 표시
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.write(question)
+
+    # 답변 생성
+    with st.chat_message("assistant"):
+        with st.spinner("답변을 생성하는 중..."):
+            response = rag_chain.invoke({"input": question})
+        answer = response["answer"]
+        st.write(answer)
+
         docs = response.get("context", [])
-        st.subheader(f"📑 참조 문서 ({len(docs)}개)")
-        for i, doc in enumerate(docs, start=1):
-            page = doc.metadata.get("page", "?")
-            with st.expander(f"문서 {i} (p.{page})"):
-                st.write(doc.page_content)
+        ctx_list = [
+            {"page": d.metadata.get("page", "?"), "content": d.page_content}
+            for d in docs
+        ]
+        if show_context and ctx_list:
+            with st.expander(f"📑 참조 문서 ({len(ctx_list)}개)"):
+                for i, ctx in enumerate(ctx_list, start=1):
+                    st.markdown(f"**문서 {i} (p.{ctx['page']})**")
+                    st.write(ctx["content"])
+
+    # 답변을 기록에 추가 (참조 문서도 함께 저장)
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": answer,
+        "context": ctx_list,
+    })
